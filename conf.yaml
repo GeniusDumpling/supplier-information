@@ -1,0 +1,63 @@
+# 百度千帆 AI 联网搜索参数配置
+search:
+  keyword: 大疆供应商
+  use_baidu: true              # 是否启用百度千帆 AI 搜索
+  instruction: 聚焦"大疆某模块的上游供应商"这一主题，优先返回拆解报告、供应链分析、财报、供应商获奖新闻等来源，过滤与大疆无关的泛新闻。
+  edition: standard
+  search_source: baidu_search_v2
+  recency_filter: none           # 网页日期，none(不限) | week(7天) | month(30天) | semiyear(180天) | year(365天)
+  top_k: 50               
+  safe_search: false 
+
+  # 资源类型过滤
+  resource_types:
+    - type: web
+      top_k: 50
+    - type: video
+      top_k: 0
+    - type: image
+      top_k: 0
+    - type: aladdin
+      top_k: 0
+
+  # 域名过滤（留空列表表示不限）
+  domain_filter: []
+
+  # 请求超时（秒）
+  timeout: 30
+
+  # -- 抓取网页完整正文（trafilatura）--
+  fetch_fulltext: true          # 是否抓取每个 URL 的完整正文生成 *_fulltext.md 快照
+  fetch_delay: 1.0              # 每条之间的抓取间隔（秒），避免请求过快
+
+# -- LLM 供应关系分析（需在 .env 配置 DEEPSEEK_API_KEY）--
+llm:
+  api_base: https://api.deepseek.com
+  model: deepseek-chat
+  temperature: 0.2              # 分析类任务用低温度更稳定
+  max_tokens: 4096              # 单次响应最大 token
+  chunk_size: 10                # 每个请求分析多少条网页（分批避免超长）
+  timeout: 120                  # 单次请求超时（秒）
+
+# -- Brave Search 增强搜索（需在 .env 配置 BRAVE_SEARCH_API_KEY）--
+# 使用独立英文关键词搜索，返回英文网页，与中文百度结果互补
+brave:
+  enabled: true                 # 是否启用 Brave 搜索
+  keyword_en: 'DJI "supply chain" components'
+  count: 20                     # 单次返回条数（最大 20）
+  country: ALL                  # 国家/地区代码（ALL/US/GB/JP/CN 等）
+  search_lang: en               # 内容语言（en/zh/ja 等）
+  safesearch: moderate          # 安全搜索 off/moderate/strict
+  freshness: ""                # 显式日期过滤 pd/pw/pm/py 或日期范围；留空则按 search.recency_filter 自动映射
+  timeout: 30                  # 请求超时（秒）
+
+# -- 供应商验证（supplier_verify.py）--
+verify:
+  enabled: true                # 是否启用验证环节
+  search_limit: 20             # 百度定向搜索取的条数上限（实际只用前 fetch_limit 条）
+  fetch_limit: 5               # 每个供应商抓取全文的条数
+  fetch_delay: 0.5             # 每条抓取间隔（秒）
+  max_suppliers: 0             # 0=不限；正整数表示最多验证多少家（用于控制成本）
+
+
+
