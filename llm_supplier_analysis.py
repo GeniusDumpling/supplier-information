@@ -257,6 +257,10 @@ def main(fulltext_path: str = "") -> str:
     # 定位 *_fulltext.md，输出目录与其同目录（即  厂商名_时间戳 子目录）
     search_results = os.path.join(base_dir(), "search_results")
     if fulltext_path:
+        if not fulltext_path.endswith("_fulltext.md"):
+            raise SystemExit(
+                f"传入的不是 *_fulltext.md（{fulltext_path}），"
+                "拒绝把搜索快照/其他文档当作全文进行分析。")
         md_path = fulltext_path
     else:
         files = glob.glob(os.path.join(search_results, "**", "*_fulltext.md"), recursive=True) \

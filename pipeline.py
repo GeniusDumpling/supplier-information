@@ -74,6 +74,11 @@ def main() -> int:
     if not fulltext:
         failures.append("阶段 1：搜索/抓取未产出 fulltext")
         logger.error("[阶段 1/3] 未产出全文快照，中止后续阶段。")
+    elif not fulltext.endswith("_fulltext.md"):
+        # 增量模式下本轮所有 URL 均已知，阶段 1 只产出搜索快照
+        artifacts["primary_output"] = fulltext
+        logger.info("[阶段 1/3] 无新增全文（增量模式下全部 URL 均为已知），"
+                    f"跳过 LLM 分析与验证。产物：{fulltext}")
     else:
         artifacts["fulltext"] = fulltext
         logger.info(f"[阶段 1/3] 完成 -> {fulltext}")
