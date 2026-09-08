@@ -316,8 +316,13 @@ def save_confirmed_relations(sec: dict, path: str = CONFIRMED_RELATIONS_MD) -> s
 
 
 def update_confirmed_relations(summary_path: str, run_id: str) -> str:
-    """把本次 summary 中"可信度=明确"的关系增量累积到 confirmed_relations.md。"""
-    confirmed = [r for r in parse_relations(summary_path) if r["credibility"] == "明确"]
+    """把本次 summary 中"采购方=大疆/DJI 且 可信度=明确"的关系增量累积到 confirmed_relations.md。"""
+    def is_dji(r):
+        buyer = (r.get("buyer") or "")
+        return "大疆" in buyer or "DJI" in buyer
+
+    confirmed = [r for r in parse_relations(summary_path)
+                 if r["credibility"] == "明确" and is_dji(r)]
     sec = load_confirmed_relations()
     for r in confirmed:
         s = r["supplier"]
