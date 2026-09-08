@@ -42,18 +42,6 @@ llm:
   timeout: 120                  # 单次请求超时（秒）
   max_retries: 3                # 单个请求失败时的重试次数
 
-# -- Brave Search 增强搜索（需在 .env 配置 BRAVE_SEARCH_API_KEY）--
-# 使用独立英文关键词搜索，返回英文网页，与中文百度结果互补
-brave:
-  enabled: true                 # 是否启用 Brave 搜索
-  keyword_en: 'DJI "supply chain" components'
-  count: 20                     # 单次返回条数（最大 20）
-  country: ALL                  # 国家/地区代码（ALL/US/GB/JP/CN 等）
-  search_lang: en               # 内容语言（en/zh/ja 等）
-  safesearch: moderate          # 安全搜索 off/moderate/strict
-  freshness: ""                # 显式日期过滤 pd/pw/pm/py 或日期范围；留空则按 search.recency_filter 自动映射
-  timeout: 30                  # 请求超时（秒）
-
 # -- 供应商验证（supplier_verify.py）--
 verify:
   enabled: true                # 是否启用验证环节

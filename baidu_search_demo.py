@@ -97,7 +97,7 @@ def base_dir() -> str:
 
 
 def load_conf(config_name: str = "conf.yaml") -> dict:
-    """从同级 conf.yaml 读取全部配置（search / brave 等）。"""
+    """从同级 conf.yaml 读取全部配置（search / llm / verify 等）。"""
     path = os.path.join(base_dir(), config_name)
     if not os.path.exists(path):
         raise FileNotFoundError(f"找不到配置文件：{path}")
@@ -120,23 +120,6 @@ def get_api_key() -> str:
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
                     if key.strip() == "BAIDU_QIANFAN_API_KEY":
-                        return value.strip().strip('"').strip("'")
-    return ""
-
-
-def get_brave_key() -> str:
-    """从环境变量或 .env 读取 Brave Search API Key（环境变量优先）。"""
-    env_val = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
-    if env_val:
-        return env_val.strip('"').strip("'")
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    if key.strip() == "BRAVE_SEARCH_API_KEY":
                         return value.strip().strip('"').strip("'")
     return ""
 
@@ -204,67 +187,6 @@ def search(query: str, conf: dict) -> dict:
     response = requests.post(API_URL, headers=headers, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=timeout)
     response.raise_for_status()
     return response.json()
-
-
-BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
-# 百度 recency_filter 到 Brave freshness 的映射
-_RECENCY_TO_FRESHNESS = {
-    "week": "pw", "month": "pm", "semiyear": "py", "year": "py",
-}
-
-
-@with_retry()
-def brave_search(query: str, search_conf: dict, brave_conf: dict) -> list:
-    """调用 Brave Search API，返回 [{title, url, date, content}, ...]（按 web 结果）。"""
-    params = {
-        "q": query,
-        "count": int(brave_conf.get("count", 20)),
-        "country": brave_conf.get("country", "CN"),
-        "search_lang": brave_conf.get("search_lang", "zh"),
-        "safesearch": brave_conf.get("safesearch", "moderate"),
-    }
-    # 显式 freshness 优先；否则按百度 recency_filter 自动映射
-    freshness = brave_conf.get("freshness", "") or ""
-    if not freshness:
-        recency = str(search_conf.get("recency_filter", "")).lower()
-        if recency in _RECENCY_TO_FRESHNESS:
-            freshness = _RECENCY_TO_FRESHNESS[recency]
-    if freshness:
-        params["freshness"] = freshness
-
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": get_brave_key(),
-    }
-    resp = requests.get(BRAVE_SEARCH_URL, params=params, headers=headers,
-                        timeout=brave_conf.get("timeout", 30))
-    resp.raise_for_status()
-    data = resp.json()
-
-    refs = []
-    for item in data.get("web", {}).get("results", []):
-        refs.append({
-            "title": item.get("title", "无标题"),
-            "url": item.get("url", ""),
-            "date": item.get("age", ""),
-            "content": item.get("description", ""),
-            "source": "brave",
-        })
-    return refs
-
-
-def merge_refs(*ref_lists: list) -> list:
-    """多来源结果合并去重（按 URL）。返回合并后的引用列表。"""
-    seen = set()
-    merged = []
-    for refs in ref_lists:
-        for ref in refs:
-            url = ref.get("url", "")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            merged.append(ref)
-    return merged
 
 
 def save_snapshot(query: str, refs: list, out_dir: str) -> str:
@@ -400,10 +322,9 @@ def save_fulltext_snapshot(query: str, refs: list, out_dir: str, delay: float = 
 
 
 def main() -> str:
-    """搜索(百度+Brave)→合并去重→快照→可选抓取全文。返回主产物（fulltext 优先）路径。"""
+    """百度搜索→合并快照→可选抓取全文。返回主产物（fulltext 优先）路径。"""
     conf = load_conf()
     search_conf = conf.get("search", {})
-    brave_conf = conf.get("brave", {}) or {}
 
     query = str(search_conf.get("keyword", "")).strip()
     if not query:
@@ -417,41 +338,22 @@ def main() -> str:
     logger.info(f"正在搜索：{query} ...")
     logger.info(f"输出目录：{out_dir}")
 
-    ref_lists = []
-
-    # 1) 百度千帆 AI 搜索
+    refs = []
     use_baidu = search_conf.get("use_baidu", True)
-    if use_baidu:
-        if not get_api_key():
-            logger.warning("未找到 BAIDU_QIANFAN_API_KEY，请在 .env 或环境变量中配置。")
-            return ""
-        logger.info("[百度] 调用千帆 AI 搜索 ...")
-        baidu_result = search(query, search_conf)
-        refs_baidu = baidu_result.get("references", [])
-        for _r in refs_baidu:
-            _r["source"] = "baidu"
-        logger.info(f"[百度] 获取 {len(refs_baidu)} 条结果。")
-        ref_lists.append(refs_baidu)
-    else:
-        refs_baidu = []
+    if not use_baidu:
+        logger.warning("use_baidu=false，当前流程仅支持百度搜索，无法继续。")
+        return ""
+    # 百度千帆 AI 搜索
+    if not get_api_key():
+        logger.warning("未找到 BAIDU_QIANFAN_API_KEY，请在 .env 或环境变量中配置。")
+        return ""
+    logger.info("[百度] 调用千帆 AI 搜索 ...")
+    baidu_result = search(query, search_conf)
+    refs = baidu_result.get("references", [])
+    for _r in refs:
+        _r["source"] = "baidu"
+    logger.info(f"[百度] 获取 {len(refs)} 条结果。")
 
-    # 2) Brave Search（独立英文关键词）
-    refs_brave = []
-    if brave_conf.get("enabled", True):
-        if not get_brave_key():
-            logger.warning("未找到 BRAVE_SEARCH_API_KEY，请在 .env 或环境变量中配置。")
-            return ""
-        brave_query = str(brave_conf.get("keyword_en", "")).strip() or query
-        logger.info(f"[Brave] 调用 Brave Search API（关键词：{brave_query}）...")
-        try:
-            refs_brave = brave_search(brave_query, search_conf, brave_conf)
-            logger.info(f"[Brave] 获取 {len(refs_brave)} 条结果。")
-            ref_lists.append(refs_brave)
-        except Exception as e:
-            logger.warning(f"[Brave] 搜索失败：{e}")
-
-    # 合并去重
-    refs = merge_refs(*ref_lists)
     logger.info(f"合并去重后共 {len(refs)} 条结果。")
     if not refs:
         logger.warning("没有获取到任何结果，请检查关键词或 API 配置。")

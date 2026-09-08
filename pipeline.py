@@ -68,7 +68,7 @@ def main() -> int:
     artifacts = {"run_id": run_id}
     failures = []
 
-    # 阶段 1：搜索（百度+Brave）+ 抓取全文
+    # 阶段 1：百度搜索 + 抓取全文
     logger.info("[阶段 1/3] 搜索并抓取全文 ...")
     fulltext = try_stage("阶段 1/3", search_main)
     if not fulltext:
