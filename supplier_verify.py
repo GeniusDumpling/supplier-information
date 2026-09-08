@@ -243,9 +243,9 @@ def main(confirmed_path: str = "") -> str:
     # 回写文档
     save_confirmed_relations(sec, path)
 
-    # 生成验证报告（放 _index 下，独立时间戳）
+    # 生成验证报告（与来源文档同目录，独立时间戳）
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(os.path.dirname(CONFIRMED_RELATIONS_MD), f"verification_{ts}.md")
+    out_path = os.path.join(os.path.dirname(path), f"verification_{ts}.md")
     lines = [
         f"# 供应商验证报告（{ts}）",
         f"\n依据文档：{os.path.basename(path)}",
