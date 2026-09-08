@@ -1,0 +1,8 @@
+# 供应商信息采集管线直接依赖
+# 安装：pip install -r requirements.txt
+# 顶层依赖（传递依赖由 pip 自动解析）
+
+requests==2.33.1
+PyYAML==6.0.3
+python-dotenv==1.2.2
+trafilatura==2.2.0
