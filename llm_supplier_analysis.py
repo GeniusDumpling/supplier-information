@@ -419,12 +419,13 @@ def main(fulltext_path: str = "") -> str:
         logger.info(f"增量报告已生成：{delta_path}")
     except Exception as e:
         logger.warning(f"生成增量报告失败：{e}")
-    # 维护"明确供应关系"文档，供独立验证流程定时消费
+    # 维护"明确供应关系"文档（失败时向上抛出，使 pipeline 阶段标记失败）
     try:
         conf_path = update_confirmed_relations(out_path, run_id)
         logger.info(f"明确供应关系已维护：{conf_path}")
     except Exception as e:
-        logger.warning(f"维护明确供应关系失败：{e}")
+        logger.error(f"维护明确供应关系失败：{e}")
+        raise
     return out_path
 
 
