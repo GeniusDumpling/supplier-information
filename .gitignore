@@ -1,2 +1,4 @@
 .env
 search_results/
+__pycache__/
+logs/

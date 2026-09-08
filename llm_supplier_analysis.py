@@ -1,10 +1,17 @@
+import glob
 import json
+import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
+
 import yaml
+
 import requests
+
+logger = logging.getLogger(__name__)
 
 def base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +26,10 @@ def load_yaml(name: str) -> dict:
 
 
 def get_deepseek_key() -> str:
+    """从环境变量或 .env 读取 DeepSeek API Key（环境变量优先）。"""
+    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_val:
+        return env_val.strip('"').strip("'")
     env_path = os.path.join(base_dir(), ".env")
     key = ""
     if os.path.exists(env_path):
@@ -29,7 +40,7 @@ def get_deepseek_key() -> str:
                     k, _, v = line.partition("=")
                     if k.strip() == "DEEPSEEK_API_KEY":
                         key = v.strip().strip('"').strip("'")
-    return key or os.environ.get("DEEPSEEK_API_KEY", "")
+    return key
 
 
 def parse_fulltext(path: str) -> list:
@@ -112,32 +123,160 @@ def call_llm(api_key: str, conf: dict, user_content: str) -> str:
         "max_tokens": conf.get("max_tokens", 4096),
         "stream": False,
     }
-    resp = requests.post(url, headers=headers, json=payload,
-                         timeout=conf.get("timeout", 120))
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    max_retries = int(conf.get("max_retries", 3))
+    timeout = conf.get("timeout", 120)
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.HTTPError) as e:
+            if attempt >= max_retries:
+                raise
+            wait = 2 ** attempt
+            logger.warning(f"LLM 请求失败（{e}），{wait}s 后重试 {attempt + 1}/{max_retries} ...")
+            time.sleep(wait)
+    raise RuntimeError("LLM 请求失败")
 
 
-def main():
-    # 定位最新 *_fulltext.md
-    out_dir = os.path.join(base_dir(), "search_results")
-    md_files = [f for f in os.listdir(out_dir) if f.endswith("_fulltext.md")] if os.path.exists(out_dir) else []
-    if not md_files:
-        raise SystemExit("未找到 *_fulltext.md，请先运行 baidu_search_demo.py 生成全文快照。")
-    md_files.sort(reverse=True)
-    md_path = os.path.join(out_dir, md_files[0])
+def parse_relations(summary_path: str) -> list:
+    """解析 summary 中所有关系块，返回 [{supplier, supply, credibility, buyer, url}, ...]。"""
+    with open(summary_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    blocks = re.split(r"^###\s*关系\d+\s*$", text, flags=re.M)
+
+    def field(block, name):
+        m = re.search(rf"^-\s*{name}：\s*(.*)$", block, flags=re.M)
+        return m.group(1).strip() if m else ""
+
+    rels = []
+    for block in blocks:
+        if "- 供应商：" not in block or "- 可信度：" not in block:
+            continue
+        supplier = field(block, "供应商")
+        if not supplier:
+            continue
+        rels.append({
+            "supplier": supplier,
+            "supply": field(block, "供应内容/模块"),
+            "credibility": field(block, "可信度"),
+            "buyer": field(block, "采购方"),
+            "url": (field(block, "来源（网页原始URL）").split("；")[0].split(";")[0].strip()),
+        })
+    return rels
+
+
+REL_INDEX_JSON = os.path.join(base_dir(), "search_results", "_index", "supplier_relations.json")
+
+
+def update_relation_index(summary_path: str, run_id: str) -> str:
+    """把本次关系累积到 _index/supplier_relations.json，并生成差分报告。
+
+    返回增量报告路径。new=相对历史首次出现的供应商；not_mentioned=本次未再被提及的已知供应商。
+    """
+    rels = parse_relations(summary_path)
+
+    idx = {}
+    if os.path.exists(REL_INDEX_JSON):
+        try:
+            with open(REL_INDEX_JSON, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+        except Exception:
+            idx = {}
+    cumulative = idx.get("cumulative", {})
+    prev = set(cumulative.keys())  # 本次 merge 前已存在的供应商
+
+    today_suppliers = set()
+    for r in rels:
+        s = r["supplier"]
+        today_suppliers.add(s)
+        rec = cumulative.get(s)
+        if rec is None:
+            cumulative[s] = {
+                "supplier": s, "first_run": run_id, "last_run": run_id,
+                "count": 1, "credibility": r["credibility"],
+                "sources": [r["url"]] if r["url"] else [],
+            }
+        else:
+            rec["last_run"] = run_id
+            rec["count"] += 1
+            rec["credibility"] = r["credibility"]
+            if r["url"] and r["url"] not in rec["sources"]:
+                rec["sources"].append(r["url"])
+
+    new_suppliers = [r for r in rels if r["supplier"] not in prev]
+    not_mentioned = sorted(s for s in prev if s not in today_suppliers)
+
+    idx["updated_run"] = run_id
+    idx["cumulative"] = cumulative
+    with open(REL_INDEX_JSON, "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False, indent=2)
+
+    ts = run_id.rsplit("_", 1)[-1] if "_" in run_id else run_id
+    delta_path = os.path.join(os.path.dirname(REL_INDEX_JSON), f"incremental_{ts}.md")
+    lines = [
+        f"# 供应商关系增量报告（run={run_id}）",
+        f"\n分析时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"本次解析到 {len(rels)} 条关系，涉及 {len(today_suppliers)} 个供应商\n",
+        "## 新增供应商（相对历史首次出现）",
+    ]
+    if new_suppliers:
+        for r in new_suppliers:
+            lines.append(f"- **{r['supplier']}**｜{r['supply'] or '—'}｜可信度:{r['credibility']}"
+                         + (f"｜{r['url']}" if r["url"] else ""))
+    else:
+        lines.append("- （无）")
+
+    lines.append("\n## 本次出现的历史已知供应商")
+    if today_suppliers:
+        for s in sorted(today_suppliers):
+            rec = cumulative[s]
+            lines.append(f"- {s}｜可信度:{rec['credibility']}｜累计 {rec['count']} 次｜末次 {rec['last_run']}")
+    else:
+        lines.append("- （无）")
+
+    lines.append("\n## 本次未再提及的已知供应商（待观察：可能退链/此处无新资料）")
+    if not_mentioned:
+        for s in not_mentioned:
+            rec = cumulative[s]
+            lines.append(f"- {s}｜累计 {rec['count']} 次｜末次 {rec['last_run']}")
+    else:
+        lines.append("- （无）")
+
+    with open(delta_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return delta_path
+
+
+def main(fulltext_path: str = "") -> str:
+    """对全文快照执行 LLM 供应关系分析。返回总结文件路径。
+
+    fulltext_path 非空时使用该文件，否则定位最新 *_fulltext.md。
+    """
+    # 定位 *_fulltext.md，输出目录与其同目录（即  厂商名_时间戳 子目录）
+    search_results = os.path.join(base_dir(), "search_results")
+    if fulltext_path:
+        md_path = fulltext_path
+    else:
+        files = glob.glob(os.path.join(search_results, "**", "*_fulltext.md"), recursive=True) \
+            if os.path.exists(search_results) else []
+        if not files:
+            raise SystemExit("未找到 *_fulltext.md，请先运行搜索脚本生成全文快照。")
+        files.sort(key=os.path.getmtime, reverse=True)
+        md_path = files[0]
+    out_dir = os.path.dirname(md_path)
 
     conf = load_yaml("conf.yaml")
     llm_conf = conf.get("llm", {})
 
     api_key = get_deepseek_key()
     if not api_key:
-        raise SystemExit("未配置 DEEPSEEK_API_KEY，请在 .env 中填写（DEEPSEEK_API_KEY=你的Key）。")
+        raise SystemExit("未配置 DEEPSEEK_API_KEY，请在 .env 或环境变量中填写（DEEPSEEK_API_KEY=你的Key）。")
 
     items = parse_fulltext(md_path)
     total = len(items)
-    print(f"解析到 {total} 条网页全文：{md_path}")
+    logger.info(f"解析到 {total} 条网页全文：{md_path}")
     if total == 0:
         raise SystemExit("没有可分析的正文。")
 
@@ -147,12 +286,12 @@ def main():
     results = []
     for n, chunk in enumerate(chunks, 1):
         indices = f"{((n - 1) * chunk_size + 1)}-{((n - 1) * chunk_size + len(chunk))}"
-        print(f"[分片 {n}/{len(chunks)}] 调用 {llm_conf.get('model')} 分析 {len(chunk)} 条 ...")
+        logger.info(f"[分片 {n}/{len(chunks)}] 调用 {llm_conf.get('model')} 分析 {len(chunk)} 条 ...")
         try:
             summary = call_llm(api_key, llm_conf, build_user_content(chunk))
         except Exception as e:
             err = f"（第 {n} 片分析失败：{e}）"
-            print("  " + err)
+            logger.warning("  " + err)
             results.append(err)
             continue
         results.append(f"\n# 分片 {n}（网页 {indices}）")
@@ -174,7 +313,15 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(header) + "\n" + "\n".join(results))
 
-    print(f"分析完成，结果已保存：{out_path}")
+    logger.info(f"分析完成，结果已保存：{out_path}")
+    # 增量：把本次供应商关系累积到索引表，并生成差分报告（新增/未再提及）
+    run_id = os.path.basename(out_dir)
+    try:
+        delta_path = update_relation_index(out_path, run_id)
+        logger.info(f"增量报告已生成：{delta_path}")
+    except Exception as e:
+        logger.warning(f"生成增量报告失败：{e}")
+    return out_path
 
 
 if __name__ == "__main__":

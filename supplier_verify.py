@@ -6,10 +6,13 @@
 
 运行：python supplier_verify.py
 """
+import glob
+import logging
 import os
 import re
 import time
 from datetime import datetime
+
 import requests
 
 from baidu_search_demo import (
@@ -20,8 +23,14 @@ from baidu_search_demo import (
     fetch_fulltext,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def get_deepseek_key() -> str:
+    """从环境变量或 .env 读取 DeepSeek API Key（环境变量优先）。"""
+    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_val:
+        return env_val.strip('"').strip("'")
     env_path = os.path.join(base_dir(), ".env")
     key = ""
     if os.path.exists(env_path):
@@ -32,7 +41,7 @@ def get_deepseek_key() -> str:
                     k, _, v = line.partition("=")
                     if k.strip() == "DEEPSEEK_API_KEY":
                         key = v.strip().strip('"').strip("'")
-    return key or os.environ.get("DEEPSEEK_API_KEY", "")
+    return key
 
 
 def parse_suppliers(summary_path: str) -> list:
@@ -143,7 +152,7 @@ def call_llm(api_key: str, conf: dict, user_content: str) -> str:
             if attempt >= max_retries:
                 raise
             wait = 2 ** attempt
-            print(f"    LLM 请求失败（{e}），{wait}s 后重试 {attempt + 1}/{max_retries} ...")
+            logger.warning(f"    LLM 请求失败（{e}），{wait}s 后重试 {attempt + 1}/{max_retries} ...")
             time.sleep(wait)
     raise RuntimeError("LLM 请求失败")
 
@@ -166,7 +175,7 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
             "verdict": f"搜索失败：{e}", "confidence": "", "supply": "", "evidence": [],
         }
     refs = refs[:search_limit]
-    print(f"    [搜索] {sup['supplier']} -> 取前 {len(refs)} 条")
+    logger.info(f"    [搜索] {sup['supplier']} -> 取前 {len(refs)} 条")
 
     # 2) 抓取前 fetch_limit 条全文
     docs = []
@@ -182,7 +191,7 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
             time.sleep(fetch_delay)
 
     # 3) LLM 判定
-    print(f"    [LLM] 判定 {sup['supplier']}（抓取 {len(docs)} 条）...")
+    logger.info(f"    [LLM] 判定 {sup['supplier']}（抓取 {len(docs)} 条）...")
     user_content = build_user_content(sup["supplier"], sup.get("supply", ""), docs)
     verdict_md = call_llm(api_key, llm_conf, user_content)
 
@@ -208,50 +217,61 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
     }
 
 
-def main():
-    out_dir = os.path.join(base_dir(), "search_results")
-    summary_files = [f for f in os.listdir(out_dir)
-                     if f.endswith("_supplier_summary.md")] if os.path.exists(out_dir) else []
-    if not summary_files:
-        raise SystemExit("未找到 *_supplier_summary.md，请先运行 llm_supplier_analysis.py。")
-    summary_files.sort(reverse=True)
-    summary_path = os.path.join(out_dir, summary_files[0])
-    print(f"使用总结文件：{summary_path}")
+def main(summary_path: str = "") -> str:
+    """对总结文件中的供应商逐一定向搜索验证。返回验证报告路径。
+
+    summary_path 非空时使用该文件，否则定位最新 *_supplier_summary.md。
+    """
+    search_results = os.path.join(base_dir(), "search_results")
+    if summary_path:
+        summary_path = os.path.abspath(summary_path)
+    else:
+        files = glob.glob(os.path.join(search_results, "**", "*_supplier_summary.md"), recursive=True) \
+            if os.path.exists(search_results) else []
+        if not files:
+            raise SystemExit("未找到 *_supplier_summary.md，请先运行 llm_supplier_analysis.py。")
+        files.sort(key=os.path.getmtime, reverse=True)
+        summary_path = files[0]
+    out_dir = os.path.dirname(summary_path)
+    logger.info(f"使用总结文件：{summary_path}")
 
     conf = load_conf()
     search_conf = conf.get("search", {})
     llm_conf = conf.get("llm", {})
     verify_conf = conf.get("verify", {}) or {}
     if not verify_conf.get("enabled", True):
-        print("verify.enabled=false，跳过验证。")
-        return
+        logger.warning("verify.enabled=false，跳过验证。")
+        return ""
 
     api_key = get_deepseek_key()
     if not api_key:
-        raise SystemExit("未配置 DEEPSEEK_API_KEY，请在 .env 中填写。")
+        raise SystemExit("未配置 DEEPSEEK_API_KEY，请在 .env 或环境变量中填写。")
     if not get_api_key():
-        raise SystemExit("未配置 BAIDU_QIANFAN_API_KEY，请在 .env 中填写。")
+        raise SystemExit("未配置 BAIDU_QIANFAN_API_KEY，请在 .env 或环境变量中填写。")
 
     suppliers = parse_suppliers(summary_path)
     max_n = int(verify_conf.get("max_suppliers", 0) or 0)
     if max_n > 0:
         suppliers = suppliers[:max_n]
     total = len(suppliers)
-    print(f"待验证供应商（采购方=大疆 且 明确）：{total} 家")
+    logger.info(f"待验证供应商（采购方=大疆 且 明确）：{total} 家")
 
     results = []
     for idx, sup in enumerate(suppliers, 1):
-        print(f"[{idx}/{total}] 验证：{sup['supplier']}")
+        logger.info(f"[{idx}/{total}] 验证：{sup['supplier']}")
         try:
             res = verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf)
         except Exception as e:
+            logger.warning(f"    {sup['supplier']} 验证失败：{e}")
             res = {"supplier": sup["supplier"], "query": f"{sup['supplier']} 大疆 供应商",
                    "searched": 0, "fetched": 0, "verdict": f"验证失败：{e}",
-                   "confidence": "", "supply": "", "evidence": "", "orig_sources": []}
+                   "confidence": "", "supply": "", "evidence": "",
+                   "orig_sources": sup.get("sources", []),
+                   "orig_supply": sup.get("supply", "")}
         results.append(res)
 
     # 生成验证报告
-    base = os.path.splitext(summary_files[0])[0].replace("_supplier_summary", "")
+    base = os.path.splitext(os.path.basename(summary_path))[0].replace("_supplier_summary", "")
     out_path = os.path.join(out_dir, f"{base}_verification.md")
 
     lines = [
@@ -287,7 +307,8 @@ def main():
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print(f"\n验证完成，结果已保存：{out_path}")
+    logger.info(f"验证完成，结果已保存：{out_path}")
+    return out_path
 
 
 if __name__ == "__main__":

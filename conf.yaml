@@ -29,6 +29,8 @@ search:
   # -- 抓取网页完整正文（trafilatura）--
   fetch_fulltext: true          # 是否抓取每个 URL 的完整正文生成 *_fulltext.md 快照
   fetch_delay: 1.0              # 每条之间的抓取间隔（秒），避免请求过快
+  fetch_retries: 3              # 单条 URL 抓取失败时的重试次数
+  incremental: true             # 增量模式：只抓取/分析新增 URL，跳过 known_urls 已知库中的 URL
 
 # -- LLM 供应关系分析（需在 .env 配置 DEEPSEEK_API_KEY）--
 llm:
@@ -38,6 +40,7 @@ llm:
   max_tokens: 4096              # 单次响应最大 token
   chunk_size: 10                # 每个请求分析多少条网页（分批避免超长）
   timeout: 120                  # 单次请求超时（秒）
+  max_retries: 3                # 单个请求失败时的重试次数
 
 # -- Brave Search 增强搜索（需在 .env 配置 BRAVE_SEARCH_API_KEY）--
 # 使用独立英文关键词搜索，返回英文网页，与中文百度结果互补
