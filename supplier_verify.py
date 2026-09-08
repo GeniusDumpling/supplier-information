@@ -1,12 +1,11 @@
-"""供应商验证脚本。
+"""供应商定向验证（独立流程，可定时执行）。
 
-管道最后一步：读取 *_supplier_summary.md 中"采购方=大疆 且 可信度=明确"的供应商，
-对每家供应商用百度定向搜索"{供应商} 大疆 供应商"，抓取前几条全文后交给 LLM 判定
-该供应商与大疆的真实供应关系，输出独立验证报告 *_verification.md。
+读取 pipeline 维护的"明确供应关系"文档（search_results/_index/confirmed_relations.md），
+对其中未验证（或全部）的供应商用百度定向搜索"{供应商} 大疆 供应商"，抓取前几条全文后
+交给 LLM 判定该供应商与大疆的真实供应关系，输出验证报告，并把验证状态回写该文档。
 
 运行：python supplier_verify.py
 """
-import glob
 import logging
 import os
 import re
@@ -21,6 +20,11 @@ from baidu_search_demo import (
     get_api_key,
     search,
     fetch_fulltext,
+)
+from llm_supplier_analysis import (
+    CONFIRMED_RELATIONS_MD,
+    load_confirmed_relations,
+    save_confirmed_relations,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,51 +46,6 @@ def get_deepseek_key() -> str:
                     if k.strip() == "DEEPSEEK_API_KEY":
                         key = v.strip().strip('"').strip("'")
     return key
-
-
-def parse_suppliers(summary_path: str) -> list:
-    """解析 summary，返回 [{supplier, supply, sources}, ...]。
-
-    仅保留"采购方=大疆 且 可信度=明确"的关系，并按供应商去重。
-    """
-    with open(summary_path, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    # 按 "### 关系N" 切块；正文里也可能引用"###<关键词>"，用行首标题精确匹配
-    blocks = re.split(r"^###\s*关系\d+\s*$", text, flags=re.M)
-
-    def field(block, name):
-        m = re.search(rf"^-\s*{name}：\s*(.*)$", block, flags=re.M)
-        return m.group(1).strip() if m else ""
-
-    suppliers = {}
-    for block in blocks:
-        if "- 可信度：" not in block or "- 供应商：" not in block:
-            continue
-        credibility = field(block, "可信度")
-        if credibility != "明确":
-            continue
-        buyer = field(block, "采购方")
-        if "大疆" not in buyer and "DJI" not in buyer:
-            continue
-        supplier = field(block, "供应商").strip()
-        if not supplier:
-            continue
-        supply = field(block, "供应内容/模块")
-        src = field(block, "来源（网页原始URL）")
-        urls = [p.strip() for p in re.split(r"[；;]", src) if p.strip()]
-
-        sup = suppliers.setdefault(supplier, {
-            "supplier": supplier,
-            "supply": supply,
-            "sources": [],
-        })
-        if supply and not sup["supply"]:
-            sup["supply"] = supply
-        for u in urls:
-            if u not in sup["sources"]:
-                sup["sources"].append(u)
-    return list(suppliers.values())
 
 
 VERIFY_SYSTEM_PROMPT = (
@@ -217,23 +176,16 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
     }
 
 
-def main(summary_path: str = "") -> str:
-    """对总结文件中的供应商逐一定向搜索验证。返回验证报告路径。
+def main(confirmed_path: str = "") -> str:
+    """独立验证流程：读"明确供应关系"文档，按模式验证并回写状态。
 
-    summary_path 非空时使用该文件，否则定位最新 *_supplier_summary.md。
+    confirmed_path 非空时使用该文件，否则默认 search_results/_index/confirmed_relations.md。
+    mode=unverified（默认）只验证未验证项；mode=all 验证全部。
     """
-    search_results = os.path.join(base_dir(), "search_results")
-    if summary_path:
-        summary_path = os.path.abspath(summary_path)
-    else:
-        files = glob.glob(os.path.join(search_results, "**", "*_supplier_summary.md"), recursive=True) \
-            if os.path.exists(search_results) else []
-        if not files:
-            raise SystemExit("未找到 *_supplier_summary.md，请先运行 llm_supplier_analysis.py。")
-        files.sort(key=os.path.getmtime, reverse=True)
-        summary_path = files[0]
-    out_dir = os.path.dirname(summary_path)
-    logger.info(f"使用总结文件：{summary_path}")
+    path = os.path.abspath(confirmed_path) if confirmed_path else CONFIRMED_RELATIONS_MD
+    if not os.path.exists(path):
+        raise SystemExit(f"未找到明确供应关系文档：{path}（请先运行 pipeline.py 分析生成）。")
+    logger.info(f"读取明确供应关系文档：{path}")
 
     conf = load_conf()
     search_conf = conf.get("search", {})
@@ -249,37 +201,56 @@ def main(summary_path: str = "") -> str:
     if not get_api_key():
         raise SystemExit("未配置 BAIDU_QIANFAN_API_KEY，请在 .env 或环境变量中填写。")
 
-    suppliers = parse_suppliers(summary_path)
+    sec = load_confirmed_relations(path)
+    if not sec:
+        logger.warning("明确供应关系文档为空，无待验证项。")
+        return ""
+
+    mode = str(verify_conf.get("mode", "unverified")).strip().lower()
+    targets = []
+    for name, rec in sec.items():
+        if mode == "all" or rec.get("verify_status", "未验证") != "已验证":
+            targets.append((name, {
+                "supplier": name,
+                "supply": rec.get("supply", ""),
+                "sources": rec.get("sources", []),
+            }))
+
     max_n = int(verify_conf.get("max_suppliers", 0) or 0)
     if max_n > 0:
-        suppliers = suppliers[:max_n]
-    total = len(suppliers)
-    logger.info(f"待验证供应商（采购方=大疆 且 明确）：{total} 家")
+        targets = targets[:max_n]
+    total = len(targets)
+    logger.info(f"待验证供应商（mode={mode}）：{total}/{len(sec)} 家")
 
     results = []
-    for idx, sup in enumerate(suppliers, 1):
-        logger.info(f"[{idx}/{total}] 验证：{sup['supplier']}")
+    for idx, (name, sup) in enumerate(targets, 1):
+        logger.info(f"[{idx}/{total}] 验证：{name}")
         try:
             res = verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf)
         except Exception as e:
-            logger.warning(f"    {sup['supplier']} 验证失败：{e}")
-            res = {"supplier": sup["supplier"], "query": f"{sup['supplier']} 大疆 供应商",
+            logger.warning(f"    {name} 验证失败：{e}")
+            res = {"supplier": name, "query": f"{name} 大疆 供应商",
                    "searched": 0, "fetched": 0, "verdict": f"验证失败：{e}",
                    "confidence": "", "supply": "", "evidence": "",
                    "orig_sources": sup.get("sources", []),
                    "orig_supply": sup.get("supply", "")}
         results.append(res)
+        # 回写验证状态（"失败" 关键字标记验证失败，否则视为已验证）
+        sec[name]["verify_status"] = "验证失败" if "失败" in res["verdict"] else "已验证"
+        sec[name]["verify_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sec[name]["verify_verdict"] = f"{res['verdict']}；{res['supply']}"
 
-    # 生成验证报告
-    base = os.path.splitext(os.path.basename(summary_path))[0].replace("_supplier_summary", "")
-    out_path = os.path.join(out_dir, f"{base}_verification.md")
+    # 回写文档
+    save_confirmed_relations(sec, path)
 
+    # 生成验证报告（放 _index 下，独立时间戳）
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(os.path.dirname(CONFIRMED_RELATIONS_MD), f"verification_{ts}.md")
     lines = [
-        f"# 供应商验证报告：{base}",
-        f"\n基于总结文件：{os.path.basename(summary_path)}",
+        f"# 供应商验证报告（{ts}）",
+        f"\n依据文档：{os.path.basename(path)}",
         f"验证时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-        f"验证方式：对每家供应商用百度定向搜索\"{{供应商}} 大疆 供应商\"，抓取前 {verify_conf.get('fetch_limit', 5)} 条全文后由 LLM 判定",
-        f"待验证供应商数：{total}",
+        f"验证模式：{mode}，待验证供应商数：{total}",
         "",
         "## 验证结果汇总",
         "",
@@ -312,4 +283,7 @@ def main(summary_path: str = "") -> str:
 
 
 if __name__ == "__main__":
+    # 独立运行时显式配置日志（无上层 handler 也有输出）
+    logging.basicConfig(level=logging.INFO,
+                        format="[%(asctime)s][%(levelname)s][%(name)s] %(message)s")
     main()

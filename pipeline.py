@@ -1,6 +1,8 @@
-"""统一调度入口：串起 搜索→抓取全文→LLM 供应关系分析→供应商验证。
+"""统一调度入口：串起 搜索→抓取全文→LLM 供应关系分析。
 
 - 生成统一 run_id 贯穿各阶段产物命名（run_id 由各模块 stamp() 使用）；
+- LLM 分析后维护"明确供应关系"文档（search_results/_index/confirmed_relations.md）；
+- 供应商定向验证为独立流程（python supplier_verify.py），定时读取该文档执行；
 - 日志写入 logs/pipeline_<run_id>.log（RotatingFileHandler，含控制台输出）；
 - 运行结束写入状态摘要 logs/pipeline_<run_id>.json。
 
@@ -14,8 +16,7 @@ import sys
 from datetime import datetime
 
 from baidu_search_demo import base_dir, load_conf, set_run_id, main as search_main
-from llm_supplier_analysis import main as llm_main
-from supplier_verify import main as verify_main
+from llm_supplier_analysis import main as llm_main, CONFIRMED_RELATIONS_MD
 
 logger = logging.getLogger("pipeline")
 
@@ -69,38 +70,33 @@ def main() -> int:
     failures = []
 
     # 阶段 1：百度搜索 + 抓取全文
-    logger.info("[阶段 1/3] 搜索并抓取全文 ...")
-    fulltext = try_stage("阶段 1/3", search_main)
+    logger.info("[阶段 1/2] 搜索并抓取全文 ...")
+    fulltext = try_stage("阶段 1/2", search_main)
     if not fulltext:
         failures.append("阶段 1：搜索/抓取未产出 fulltext")
-        logger.error("[阶段 1/3] 未产出全文快照，中止后续阶段。")
+        logger.error("[阶段 1/2] 未产出全文快照，中止后续阶段。")
     elif not fulltext.endswith("_fulltext.md"):
         # 增量模式下本轮所有 URL 均已知，阶段 1 只产出搜索快照
         artifacts["primary_output"] = fulltext
-        logger.info("[阶段 1/3] 无新增全文（增量模式下全部 URL 均为已知），"
-                    f"跳过 LLM 分析与验证。产物：{fulltext}")
+        logger.info("[阶段 1/2] 无新增全文（增量模式下全部 URL 均为已知），"
+                    f"跳过 LLM 分析。产物：{fulltext}")
     else:
         artifacts["fulltext"] = fulltext
-        logger.info(f"[阶段 1/3] 完成 -> {fulltext}")
+        logger.info(f"[阶段 1/2] 完成 -> {fulltext}")
 
-        # 阶段 2：LLM 供应关系分析
-        logger.info("[阶段 2/3] LLM 供应关系分析 ...")
-        summary = try_stage("阶段 2/3", llm_main, fulltext)
+        # 阶段 2：LLM 供应关系分析（并维护明确供应关系文档）
+        logger.info("[阶段 2/2] LLM 供应关系分析 ...")
+        summary = try_stage("阶段 2/2", llm_main, fulltext)
         if not summary:
             failures.append("阶段 2：LLM 供应关系分析未产出 summary")
-            logger.error("[阶段 2/3] 未产出总结文件。")
+            logger.error("[阶段 2/2] 未产出总结文件。")
         else:
             artifacts["summary"] = summary
-            logger.info(f"[阶段 2/3] 完成 -> {summary}")
+            artifacts["confirmed_relations"] = CONFIRMED_RELATIONS_MD
+            logger.info(f"[阶段 2/2] 完成 -> {summary}")
+            logger.info(f"[阶段 2/2] 明确供应关系文档 -> {CONFIRMED_RELATIONS_MD}")
 
-            # 阶段 3：供应商验证
-            logger.info("[阶段 3/3] 供应商定向验证 ...")
-            verification = try_stage("阶段 3/3", verify_main, summary)
-            if verification:
-                artifacts["verification"] = verification
-                logger.info(f"[阶段 3/3] 完成 -> {verification}")
-            else:
-                logger.warning("[阶段 3/3] 已跳过（verify.enabled=false 或没有可验证供应商）。")
+    logger.info("[注] 供应商验证为独立流程：另跑 `python supplier_verify.py` 定时执行")
 
     status = "failed" if failures else "ok"
     summary_payload = {

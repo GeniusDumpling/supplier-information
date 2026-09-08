@@ -249,6 +249,95 @@ def update_relation_index(summary_path: str, run_id: str) -> str:
     return delta_path
 
 
+CONFIRMED_RELATIONS_MD = os.path.join(
+    base_dir(), "search_results", "_index", "confirmed_relations.md")
+
+
+def load_confirmed_relations(path: str = CONFIRMED_RELATIONS_MD) -> dict:
+    """解析 confirmed_relations.md ->
+    {supplier: {supply,first,last,count,sources,verify_status,verify_time,verify_verdict}}。"""
+    sec = {}
+    if not os.path.exists(path):
+        return sec
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    keymap = {"供应内容": "supply", "首次出现": "first", "末次出现": "last",
+              "出现次数": "count", "验证状态": "verify_status",
+              "验证时间": "verify_time", "验证结论": "verify_verdict"}
+    for part in re.split(r"^##\s+", text, flags=re.M)[1:]:
+        lines = part.split("\n")
+        name = lines[0].strip()
+        if not name:
+            continue
+        rec = {"sources": [], "verify_status": "未验证", "verify_time": "", "verify_verdict": ""}
+        collecting = False
+        for line in lines[1:]:
+            line = line.strip()
+            if line.startswith("- 来源URL："):
+                collecting = True
+                continue
+            if collecting:
+                if re.match(r"^- https?://", line):
+                    rec["sources"].append(line[2:].strip())
+                    continue
+                collecting = False
+            m = re.match(r"^- ([^：]+)：\s*(.*)$", line)
+            if m and m.group(1) in keymap:
+                rec[keymap[m.group(1)]] = m.group(2).strip()
+        sec[name] = rec
+    return sec
+
+
+def save_confirmed_relations(sec: dict, path: str = CONFIRMED_RELATIONS_MD) -> str:
+    """把明确供应关系写回 confirmed_relations.md。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [
+        "# 明确供应关系（可信度=明确）",
+        "<!-- 由 llm_supplier_analysis 每次分析后增量维护；supplier_verify 独立定时读取并回写验证状态 -->",
+        "",
+    ]
+    for name in sorted(sec.keys()):
+        rec = sec[name]
+        lines.append(f"## {name}")
+        lines.append(f"- 供应内容：{rec.get('supply', '')}")
+        lines.append(f"- 首次出现：{rec.get('first', '')}")
+        lines.append(f"- 末次出现：{rec.get('last', '')}")
+        lines.append(f"- 出现次数：{rec.get('count', '')}")
+        lines.append("- 来源URL：")
+        for u in rec.get("sources", []):
+            lines.append(f"    - {u}")
+        lines.append(f"- 验证状态：{rec.get('verify_status', '未验证')}")
+        lines.append(f"- 验证时间：{rec.get('verify_time', '')}")
+        lines.append(f"- 验证结论：{rec.get('verify_verdict', '')}")
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def update_confirmed_relations(summary_path: str, run_id: str) -> str:
+    """把本次 summary 中"可信度=明确"的关系增量累积到 confirmed_relations.md。"""
+    confirmed = [r for r in parse_relations(summary_path) if r["credibility"] == "明确"]
+    sec = load_confirmed_relations()
+    for r in confirmed:
+        s = r["supplier"]
+        rec = sec.get(s)
+        if rec is None:
+            sec[s] = {
+                "supply": r["supply"], "first": run_id, "last": run_id, "count": 1,
+                "sources": [r["url"]] if r["url"] else [],
+                "verify_status": "未验证", "verify_time": "", "verify_verdict": "",
+            }
+        else:
+            rec["last"] = run_id
+            rec["count"] = int(rec.get("count") or 0) + 1
+            if r["url"] and r["url"] not in rec["sources"]:
+                rec["sources"].append(r["url"])
+    path = save_confirmed_relations(sec)
+    logger.info(f"明确供应关系已更新：{path}（当前 {len(sec)} 家）")
+    return path
+
+
 def main(fulltext_path: str = "") -> str:
     """对全文快照执行 LLM 供应关系分析。返回总结文件路径。
 
@@ -318,13 +407,19 @@ def main(fulltext_path: str = "") -> str:
         f.write("\n".join(header) + "\n" + "\n".join(results))
 
     logger.info(f"分析完成，结果已保存：{out_path}")
-    # 增量：把本次供应商关系累积到索引表，并生成差分报告（新增/未再提及）
+    # 增量：累积全量关系并生成差分报告
     run_id = os.path.basename(out_dir)
     try:
         delta_path = update_relation_index(out_path, run_id)
         logger.info(f"增量报告已生成：{delta_path}")
     except Exception as e:
         logger.warning(f"生成增量报告失败：{e}")
+    # 维护"明确供应关系"文档，供独立验证流程定时消费
+    try:
+        conf_path = update_confirmed_relations(out_path, run_id)
+        logger.info(f"明确供应关系已维护：{conf_path}")
+    except Exception as e:
+        logger.warning(f"维护明确供应关系失败：{e}")
     return out_path
 
 

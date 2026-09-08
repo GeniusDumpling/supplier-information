@@ -42,9 +42,10 @@ llm:
   timeout: 120                  # 单次请求超时（秒）
   max_retries: 3                # 单个请求失败时的重试次数
 
-# -- 供应商验证（supplier_verify.py）--
+# -- 供应商验证（supplier_verify.py，独立流程/定时执行）--
 verify:
   enabled: true                # 是否启用验证环节
+  mode: unverified             # unverified=只验证未验证项（增量）| all=重验全部
   search_limit: 20             # 百度定向搜索取的条数上限（实际只用前 fetch_limit 条）
   fetch_limit: 5               # 每个供应商抓取全文的条数
   fetch_delay: 0.5             # 每条抓取间隔（秒）
