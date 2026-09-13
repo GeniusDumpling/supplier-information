@@ -65,6 +65,42 @@ VERIFY_SYSTEM_PROMPT = (
 )
 
 
+VERIFY_SLICE_PROMPT = (
+    "你是一名供应链验证分析师。以下是一批网页全文（定向搜索某公司 与 大疆 的关系）。"
+    "请仅基于这**一批**网页证据，判定该公司与大疆之间是否存在真实的供货/代工/代理/销售等实质性关系。\n"
+    "判定标准：\n"
+    "1. 确认：原文直接写明该公司向大疆供应某产品/服务/代工/零部件，或双方确为供应链合作关系。\n"
+    "2. 否定：原文明确该公司并非大疆供应商，或两者无实质供应关系。\n"
+    "3. 待确认：当前批证据不足，无法下结论。\n"
+    '请严格按如下 Markdown 格式输出，不要输出多余解释：\n\n'
+    '- 验证结论：确认 / 否定 / 待确认\n'
+    '- 可信度：明确 / 疑似 / 不相关\n'
+    '- 供应内容/模块：\n'
+    '- 主要证据（引用原文，每条约一行，附来源URL）：\n'
+)
+
+VERIFY_MERGE_PROMPT = (
+    "你是一名供应链验证分析师。以下是对同一公司 与 大疆 之间关系的多个批次分别判定结果。"
+    "请综合这些批次的结果，给出**最终判定**。\n"
+    "综合原则：只要有批次提供明确「确认」证据即可判定确认；只有各批次均为「否定」才判定否定；"
+    "其余情况判定待确认。可信度同样综合各批次证据。\n"
+    '请严格按如下 Markdown 格式输出最终结论，不要输出多余解释：\n\n'
+    '- 验证结论：确认 / 否定 / 待确认\n'
+    '- 可信度：明确 / 疑似 / 不相关\n'
+    '- 供应内容/模块：\n'
+    '- 主要证据（汇总引用，每条约一行，附来源URL）：\n'
+)
+
+
+def build_verify_merge_content(supplier: str, slice_results: list) -> str:
+    lines = [f"待综合判定：{supplier} 与 大疆 的关系", ""]
+    for i, r in enumerate(slice_results, 1):
+        lines.append(f"== 批次 {i} ==")
+        lines.append(r)
+        lines.append("")
+    return "\n".join(lines)
+
+
 def build_user_content(supplier: str, supply_hint: str, docs: list) -> str:
     lines = [
         f"待验证供应商：{supplier}",
@@ -83,7 +119,8 @@ def build_user_content(supplier: str, supply_hint: str, docs: list) -> str:
     return "\n".join(lines)
 
 
-def call_llm(api_key: str, conf: dict, user_content: str) -> str:
+def call_llm(api_key: str, conf: dict, user_content: str,
+             sys_prompt: str = VERIFY_SYSTEM_PROMPT) -> str:
     url = conf["api_base"].rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -92,7 +129,7 @@ def call_llm(api_key: str, conf: dict, user_content: str) -> str:
     payload = {
         "model": conf["model"],
         "messages": [
-            {"role": "system", "content": VERIFY_SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content},
         ],
         "temperature": conf.get("temperature", 0.2),
@@ -117,10 +154,11 @@ def call_llm(api_key: str, conf: dict, user_content: str) -> str:
 
 
 def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
-    """对单个供应商做定向搜索 + 抓取 + LLM 判定。"""
-    query = f"{sup['supplier']} 大疆 供应商"
-    search_limit = int(verify_conf.get("search_limit", 20))
-    fetch_limit = int(verify_conf.get("fetch_limit", 5))
+    """覆盖单次请求全部结果，分片判定后综合最终结论。"""
+    supplier = sup["supplier"]
+    query = f"{supplier} 大疆 供应商"
+    search_limit = int(verify_conf.get("search_limit", 50))
+    chunk_size = int(verify_conf.get("chunk_size", 10))
     fetch_delay = float(verify_conf.get("fetch_delay", 0.5))
 
     # 1) 百度定向搜索
@@ -128,33 +166,48 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
         result = search(query, search_conf)
         refs = result.get("references", []) or []
     except Exception as e:
-        return {
-            "supplier": sup["supplier"], "query": query,
-            "searched": 0, "fetched": 0,
-            "verdict": f"搜索失败：{e}", "confidence": "", "supply": "", "evidence": [],
-        }
+        return {"supplier": supplier, "query": query, "searched": 0, "fetched": 0,
+                "verdict": f"搜索失败：{e}", "confidence": "", "supply": "", "evidence": []}
     refs = refs[:search_limit]
-    logger.info(f"    [搜索] {sup['supplier']} -> 取前 {len(refs)} 条")
+    logger.info(f"    [搜索] {supplier} -> 取前 {len(refs)} 条")
 
-    # 2) 抓取前 fetch_limit 条全文
-    docs = []
-    for ref in refs[:fetch_limit]:
+    # 2) 抓取全部结果全文
+    docs, urls = [], []
+    for ref in refs:
         url = ref.get("url", "")
         title = ref.get("title", "无标题")
         if not url:
             continue
+        urls.append(url)
         text = fetch_fulltext(url)
         if text:
             docs.append({"title": title, "url": url, "body": text})
         if fetch_delay > 0:
             time.sleep(fetch_delay)
+    logger.info(f"    [抓取] 成功 {len(docs)}/{len(urls)} 条全文")
 
-    # 3) LLM 判定
-    logger.info(f"    [LLM] 判定 {sup['supplier']}（抓取 {len(docs)} 条）...")
-    user_content = build_user_content(sup["supplier"], sup.get("supply", ""), docs)
-    verdict_md = call_llm(api_key, llm_conf, user_content)
+    # 3) 分片判定 + 综合
+    if not docs:
+        verdict_md = "- 验证结论：待确认\n- 可信度：\n- 供应内容/模块：\n- 主要证据：无可用网页"
+    else:
+        chunks = [docs[i:i + chunk_size] for i in range(0, len(docs), chunk_size)]
+        logger.info(f"    [LLM] 分片判定 {len(chunks)} 片（每片 {chunk_size} 条）...")
+        slices = []
+        for n, c in enumerate(chunks, 1):
+            logger.info(f"      [片 {n}/{len(chunks)}]")
+            slices.append(call_llm(
+                api_key, llm_conf,
+                build_user_content(supplier, sup.get("supply", ""), c),
+                VERIFY_SLICE_PROMPT))
+        if len(slices) == 1:
+            verdict_md = slices[0]
+        else:
+            logger.info("    [LLM] 综合各批次结论 ...")
+            verdict_md = call_llm(api_key, llm_conf,
+                                  build_verify_merge_content(supplier, slices),
+                                  VERIFY_MERGE_PROMPT)
 
-    # 4) 解析结论中的关键字段用于汇总表
+    # 4) 解析结论字段用于汇总表
     m = re.search(r"^-\s*验证结论：\s*(.*)$", verdict_md, flags=re.M)
     verdict = m.group(1).strip() if m else "待确认"
     m = re.search(r"^-\s*可信度：\s*(.*)$", verdict_md, flags=re.M)
@@ -163,7 +216,7 @@ def verify_supplier(api_key, sup, search_conf, llm_conf, verify_conf):
     supply = m.group(1).strip() if m else ""
 
     return {
-        "supplier": sup["supplier"],
+        "supplier": supplier,
         "query": query,
         "searched": len(refs),
         "fetched": len(docs),

@@ -46,10 +46,15 @@ llm:
 verify:
   enabled: true                # 是否启用验证环节
   mode: unverified             # unverified=只验证未验证项（增量）| all=重验全部
-  search_limit: 20             # 百度定向搜索取的条数上限（实际只用前 fetch_limit 条）
-  fetch_limit: 5               # 每个供应商抓取全文的条数
+  search_limit: 50             # 覆盖单次百度请求返回的全部结果（默认 50）
+  chunk_size: 10               # LLM 分片判定时每片网页数（避免超长）
   fetch_delay: 0.5             # 每条抓取间隔（秒）
   max_suppliers: 0             # 0=不限；正整数表示最多验证多少家（用于控制成本）
+
+# -- 零件/模块详情查询（supplier_part_detail.py）--
+part_detail:
+  fetch_top: 50                # 覆盖单次百度请求返回的全部结果（默认 50）
+  chunk_size: 10               # LLM 分片提炼时每片网页数（避免超长）
 
 
 
